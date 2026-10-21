@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vid2md-helper"
+version = "0.1.0"
+description = "vid2md 서브 서버: 긴 녹음의 부분만 받아쓰는 작업 서버"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "yt-dlp[default]>=2026.8.19",
+  "faster-whisper>=1.2.1",
+  # faster-whisper 1.2.1 calls av.open(metadata_errors=...), which PyAV 19 removed.
+  "av>=11,<19",
+]
+
+[project.scripts]
+vid2md-worker = "vid2md.remote:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

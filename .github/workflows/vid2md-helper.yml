@@ -1,0 +1,51 @@
+# vid2md 서브 서버: 긴 녹음의 5분 부분을 받아쓰는 GitHub 실행기 (공개 저장소, 실행 시간 무료).
+#
+# 대시보드(Apps Script)가 긴 녹음을 나누는 순간 이 작업 흐름을 실행기 여러 대로 시작합니다(runners 목록 한 칸에 한 대).
+# 각 실행기는 남은 부분을 하나씩 받아쓰고, 더 받을 부분이 없으면 꺼집니다. 서브 전용 키는 부분 받아쓰기만 할 수 있고,
+# 로그에는 작업 번호와 부분 번호만 남습니다(제목·용어·받아쓴 글은 "내용 숨김"으로 바뀜).
+#
+# 저장소 비밀 값: VID2MD_API_URL, VID2MD_WORKER_SECRET(백엔드의 WORKER_SECRET_HELPER).
+name: vid2md helper
+
+on:
+  workflow_dispatch:
+    inputs:
+      runners:
+        description: '실행기 목록 (대시보드가 보냄, 예: [1,2,3,4])'
+        required: true
+        default: '[1]'
+
+permissions:
+  contents: read
+
+jobs:
+  parts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(inputs.runners) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: pip install -q .
+
+      # The speech model (~1.6 GB) is downloaded once and kept between runs.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: whisper-large-v3-turbo
+
+      - name: Transcribe parts
+        env:
+          VID2MD_API_URL: ${{ secrets.VID2MD_API_URL }}
+          VID2MD_WORKER_SECRET: ${{ secrets.VID2MD_WORKER_SECRET }}
+        run: vid2md-worker --helper --model large-v3-turbo --device cpu

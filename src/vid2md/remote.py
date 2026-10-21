@@ -75,7 +75,8 @@ class Dashboard:
     def __init__(self, url: str, secret: str, drive_api: str = DRIVE_API, timeout: float = 120, name: str = ""):
         self.url, self.secret, self.drive_api, self.timeout = url, secret, drive_api, timeout
         # Tells two servers with the same key apart (which one holds which part of a shared recording).
-        self.name = name or f"{socket.gethostname()}:{os.getpid()}"
+        # VID2MD_WORKER_NAME marks a kind of worker (Colab's notebook sets "colab:…", which the dashboard notices).
+        self.name = name or os.environ.get("VID2MD_WORKER_NAME", "").strip() or f"{socket.gethostname()}:{os.getpid()}"
 
     def call(self, action: str, **params: Any) -> dict[str, Any]:
         body = json.dumps({"action": action, "secret": self.secret, "worker": self.name, **params}).encode()
@@ -210,17 +211,18 @@ class Worker:
     def __init__(self, dashboard: Dashboard, whisper: WhisperOptions, transcribe: Transcribe = build_transcript,
                  clock: Callable[[], float] = time.monotonic, span: Callable[..., list[Segment]] = transcribe_span,
                  sleep: Callable[[float], None] = time.sleep, hq_model: str = "",
-                 slides: Callable[[Path], str] = read_slides, helper: bool = False):
+                 slides: Callable[[Path], str] = read_slides, helper: bool = False, parts_only: bool = False):
         self.dashboard, self.whisper, self.transcribe, self.clock = dashboard, whisper, transcribe, clock
         self.span, self.sleep, self.slides = span, sleep, slides
         self.helper = helper  # a 서브 서버: parts only (the key allows nothing else), and its log names jobs by id
+        self.parts_only = parts_only or helper  # started only to help with the parts of a long recording
         # 고품질: the full large-v3 model for the jobs that ask for it (a local path if one is set, else its name).
         self.hq_model = hq_model or os.environ.get("VID2MD_MODEL_HQ", "") or "large-v3"
         self.held: tuple[str, Path, str] | None = None  # (job id, its sound, temp dir) kept for that job's next part
 
     def run_once(self) -> bool:
         """Claim and process one job (or one part of another worker's long recording). False when there was none."""
-        job = self.dashboard.call("worker_claim").get("job")
+        job = self.dashboard.call("worker_claim", **({"parts_only": True} if self.parts_only else {})).get("job")
         if not job or job.get("part") is None or (self.held and self.held[0] != job["id"]):
             self._drop_held()
         if not job:
@@ -549,7 +551,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--idle", type=float, default=20.0, help="대기열이 비었을 때 다시 확인할 간격(초)")
     parser.add_argument("--helper", action="store_true",
                         help="서브 서버: 서브 전용 키로 긴 녹음의 부분만 돕고, 로그에는 작업 번호만 남김 (공개 저장소용)")
-    parser.add_argument("--linger", type=float, default=90.0, help="서브 서버가 할 일이 없을 때 더 기다리는 시간(초)")
+    parser.add_argument("--parts-only", action="store_true",
+                        help="긴 녹음의 부분만 돕고 작업 전체는 가져가지 않음 (비공개 서브 서버용)")
+    parser.add_argument("--linger", type=float, default=None,
+                        help="할 일이 없을 때 더 기다리는 시간(초). 서브 서버 기본 90, --drain 기본 0")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", stream=sys.stderr)
     if args.helper:
@@ -595,14 +600,16 @@ def _main(args: argparse.Namespace) -> int:
         dashboard,
         WhisperOptions(model=args.model or config.get("model", "large-v3-turbo"), device=args.device),
         helper=args.helper,
+        parts_only=args.parts_only,
     )
     signal.signal(signal.SIGTERM, stop_on_sigterm)
     if args.once:
         worker.run_once()
         return 0
-    if args.drain or args.helper:
+    if args.drain or args.helper or args.parts_only:
+        linger = args.linger if args.linger is not None else (90.0 if args.helper or args.parts_only else 0.0)
         try:
-            count = worker.drain(linger=args.linger) if args.helper else worker.drain()
+            count = worker.drain(linger=linger) if linger else worker.drain()
         except KeyboardInterrupt:
             log.info("중지했습니다.", extra=SAFE)
             return 0

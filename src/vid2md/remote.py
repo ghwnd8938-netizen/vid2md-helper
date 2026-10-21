@@ -43,7 +43,8 @@ PROGRESS_EVERY = 15.0  # seconds between progress reports
 WAIT_EVERY = 10.0  # seconds between asks while other workers finish their parts
 AUDIO_SUFFIXES = {".mp3", ".m4a", ".wav", ".flac", ".ogg", ".opus", ".aac", ".wma"}
 LINGER_EVERY = 15.0  # seconds between asks while a 서브 서버 waits for parts that may still come back
-SAFE = {"safe": True}  # a log line that carries only ids, part numbers and counts: fine for a public log
+SAFE = {"safe": True}
+KEY_NAMES = {"full": "전체(WORKER_SECRET)", "limited": "제한(WORKER_SECRET_LIMITED)", "helper": "서브(WORKER_SECRET_HELPER)"}  # a log line that carries only ids, part numbers and counts: fine for a public log
 
 
 class QuietLogs(logging.Filter):
@@ -525,7 +526,9 @@ def key_is(dashboard: Dashboard, expected: str, attempts: int = 3, wait: float =
             continue
         if key == expected:
             return True
-        log.error("이 서버에는 %s 키를 넣어야 하는데 %s 키가 들어 있습니다. 비밀 값을 바꿀 때까지 시작하지 않습니다.", expected, key)
+        # Only the kinds of key (and the property each comes from) are named: no value, so a public log may show it.
+        log.error("이 서버에는 %s 키를 넣어야 하는데 %s 키가 들어 있습니다. 비밀 값을 바꿀 때까지 시작하지 않습니다.",
+                  KEY_NAMES.get(expected, expected), KEY_NAMES.get(str(key), str(key)), extra=SAFE)
         return False
     return True
 

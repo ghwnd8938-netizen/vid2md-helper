@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .audio import extract_mp3, media_seconds
+from .bible import check as bible_check
 from .markdown import render
 from .pipeline import Options, build_transcript
 from .segments import Segment, format_timestamp
@@ -431,6 +432,7 @@ class Worker:
                 report("영상 정보 확인 중", force=True)
                 transcript = self.transcribe(job["source"], options, progress=on_progress)
 
+        transcript, bible = self._bible(transcript)
         duration = transcript.source.duration
         self.dashboard.call(
             "worker_complete",
@@ -441,9 +443,23 @@ class Worker:
             confidence=transcript.confidence,
             duration=format_timestamp(duration) if duration else "",
             segments=segments_json(transcript.segments),
+            **({"bible": json.dumps(bible, ensure_ascii=False)} if bible else {}),
             **kept,
         )
         log.info("작업 완료: %s", transcript.source.title)
+
+    def _bible(self, transcript: Any) -> tuple[Any, list[dict[str, Any]]]:
+        """성경 대조 for what the speech recogniser wrote: what is certain goes into the transcript, the rest to the
+        editor. A failure here costs only that."""
+        if transcript.method != "whisper" or not transcript.segments:
+            return transcript, []
+        try:
+            lines, found = bible_check([s.text for s in transcript.segments])
+        except Exception as error:  # noqa: BLE001
+            log.warning("성경 대조를 하지 못했습니다: %s", type(error).__name__)
+            return transcript, []
+        segments = tuple(replace(s, text=text) for s, text in zip(transcript.segments, lines))
+        return replace(transcript, segments=segments), found
 
     def _announce_length(self, job: dict[str, Any], media: Path) -> None:
         """A recording that will be shared: its length lets the dashboard start the helpers before it is split."""

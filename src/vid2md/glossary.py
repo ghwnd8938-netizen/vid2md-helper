@@ -51,13 +51,26 @@ def _distance(a: str, b: str) -> int:
     return prev[-1]
 
 
-def _near(term: str, sample: str) -> float:
-    """Best letter-level similarity of ``term`` to any stretch of ``sample`` (both normalized)."""
+def _spoken(sample_text: str) -> tuple[str, list[int]]:
+    """The normalized sample and where each of its words starts. Dictionary words are looked up only from the start
+    of a spoken word, so a pack word that is also an ending ("에서", Esau, is the particle ~에서) is not "heard"."""
+    sample, starts = "", []
+    for token in sample_text.split():
+        part = normalize(token)
+        if part:
+            starts.append(len(sample))
+            sample += part
+    return sample, starts
+
+
+def _near(term: str, sample: str, starts: Iterable[int] | None = None) -> float:
+    """Best letter-level similarity of ``term`` to any stretch of ``sample`` (both normalized) beginning at one of
+    ``starts`` (every position when not given)."""
     n = len(term)
     want = _jamo(term)
     best = 0.0
     first, last = _lead(term[0]), term[-1]
-    for i in range(len(sample)):
+    for i in (range(len(sample)) if starts is None else starts):
         # Only stretches that start like the word or end like it: fast, and mishearings keep one of them.
         if _lead(sample[i]) != first and sample[i + n - 1:i + n] != last:
             continue
@@ -72,14 +85,14 @@ def _near(term: str, sample: str) -> float:
     return best
 
 
-def pick_hints(sample_text: str, candidates: Iterable[Sequence[str]]) -> list[str]:
+def pick_hints(sample_text: str, candidates: Iterable[Sequence[str]], fill: bool = True) -> list[str]:
     """Dictionary words ordered by how surely the recording uses them.
 
     ``candidates`` are (word, pack) pairs. Returns the words heard in the sample (exactly or as a
-    likely mishearing), most certain first, then the other words of the packs those came from,
+    likely mishearing), most certain first, then (``fill``) the other words of the packs those came from,
     best-matching pack first. Words of packs with no match are left out.
     """
-    sample = normalize(sample_text)
+    sample, starts = _spoken(sample_text)
     pairs = [(str(w).strip(), str(p or "")) for w, p in candidates if str(w).strip()]
     scores: dict[str, float] = {}
     for word, _ in pairs:
@@ -89,17 +102,19 @@ def pick_hints(sample_text: str, candidates: Iterable[Sequence[str]]) -> list[st
         if len(key) < 2 or not sample:
             scores[word] = 0.0
             continue
-        hits = sample.count(key)
+        hits = sum(1 for i in starts if sample.startswith(key, i))
         if hits:
             scores[word] = 1.0 + min(hits, 5) * 0.1
         elif re.fullmatch(r"[가-힣]+", key):
-            near = _near(key, sample)
+            near = _near(key, sample, starts)
             # Two-syllable words have few letters, so they must be closer (뒤심 / 뒷심 is one letter off).
             scores[word] = near if near >= (FUZZY_MIN if len(key) >= 3 else FUZZY_MIN_SHORT) else 0.0
         else:
             scores[word] = 0.0
     order = {w: i for i, (w, _) in enumerate(pairs)}
     found = sorted((w for w, s in scores.items() if s > 0), key=lambda w: (-scores[w], order[w]))
+    if not fill:
+        return found
     affinity: Counter[str] = Counter()
     for word, pack in pairs:
         # A two-syllable near miss is weak evidence: it may pick the word, but does not pull in its pack.

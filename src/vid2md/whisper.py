@@ -31,6 +31,11 @@ class WhisperOptions:
     word_timestamps: bool = False  # needed to split sentences between speakers
     # (word, pack) pairs from the whole dictionary: when given, a quick first listen picks the hints.
     candidates: tuple[tuple[str, str], ...] = ()
+    # The candidates are one picked pack (too big to give whole): hearing none of them, keep its leading words.
+    fallback: bool = False
+    # 부분별 힌트: each part listens to a little of itself and picks its own hints from the candidates (instead of one
+    # pick for the whole recording), so a long recording can use more of a big pack.
+    part_hints: bool = False
     # Other workers may take some of a long recording's ten-minute parts (see Share).
     share: "Share | None" = field(default=None, compare=False, repr=False)
 
@@ -114,6 +119,7 @@ def _encoder(model) -> Callable[[str], list[int]] | None:
 SAMPLE_RATE = 16000
 SAMPLE_PARTS = 6  # parts of the recording listened to first when picking hints
 SAMPLE_SECONDS = 60  # length of each part
+PART_SAMPLES, PART_SAMPLE_SECONDS = 2, 30  # 부분별 힌트: what each part listens to first
 
 # Long recordings are recognised in parts: faster-whisper computes the features of all the audio it is
 # given at once, and for an hour of speech that alone outgrows a 3 GiB server. Ten minutes at a time
@@ -141,14 +147,14 @@ def _parts(audio, seconds: int | None = None) -> list[tuple[int, int]]:
     return list(zip(bounds, bounds[1:]))
 
 
-def _sample_text(model, audio, options: WhisperOptions) -> str:
+def _sample_text(model, audio, options: WhisperOptions, count: int = SAMPLE_PARTS, seconds: int = SAMPLE_SECONDS) -> str:
     """A rough, quick transcript of a few spread-out parts (fast settings, the person's own words as hints)."""
     total = len(audio) / SAMPLE_RATE
-    if total <= SAMPLE_PARTS * SAMPLE_SECONDS:
+    if total <= count * seconds:
         parts = [audio]
     else:
-        size = SAMPLE_SECONDS * SAMPLE_RATE
-        starts = [int((k + 0.5) / SAMPLE_PARTS * len(audio) - size / 2) for k in range(SAMPLE_PARTS)]
+        size = seconds * SAMPLE_RATE
+        starts = [int((k + 0.5) / count * len(audio) - size / 2) for k in range(count)]
         parts = [audio[max(0, s):max(0, s) + size] for s in starts]
     text = []
     for part in parts:
@@ -158,11 +164,15 @@ def _sample_text(model, audio, options: WhisperOptions) -> str:
     return " ".join(text)
 
 
-def _auto_prompt(model, audio, options: WhisperOptions) -> str | None:
+def _auto_prompt(model, audio, options: WhisperOptions, count: int = SAMPLE_PARTS, seconds: int = SAMPLE_SECONDS) -> str | None:
     from .glossary import pick_hints
 
     log.info("용어 힌트를 고르는 중입니다 (영상 일부를 먼저 듣습니다)")
-    picked = pick_hints(_sample_text(model, audio, options), options.candidates)
+    # A picked pack too big to give whole: only the words heard. Its other words, unheard, would crowd the hint and
+    # cost text (25 minutes: 10.7% of letters wrong with no hint, 15.7% with 43 mostly unheard pack words).
+    picked = pick_hints(_sample_text(model, audio, options, count, seconds), options.candidates, fill=not options.fallback)
+    if not picked and options.fallback:
+        picked = list(dict.fromkeys(w for w, _ in options.candidates))
     own = [t.strip() for t in (options.prompt or "").split(",") if t.strip()]
     words = own + [w for w in picked if w not in own]
     return ", ".join(words) or None
@@ -188,6 +198,63 @@ def _model(options: WhisperOptions, device: str):
 def _span(model, audio, start: int, end: int, options: WhisperOptions, prompt: str | None, room: int,
           on_piece: Callable[[float], None] | None) -> list[Segment]:
     """Recognise audio[start:end] (samples); times in the result are from the start of the recording."""
+    if options.part_hints and options.candidates:
+        encode = _encoder(model)
+        prompt = fit_prompt(_auto_prompt(model, audio[start:end], options, PART_SAMPLES, PART_SAMPLE_SECONDS), encode)
+        room = new_tokens(prompt, encode)
+    segments = _decode(model, audio, start, end, options, prompt, room, on_piece)
+    return _repair(model, audio, start, end, options, segments) if prompt else segments
+
+
+# With hint words the model sometimes writes one sentence and jumps 30-40 seconds ahead, leaving the speech in
+# between out. Where a hinted pass leaves a gap or a stretch with too few letters for its length, that stretch is
+# recognised again without hints. Letters wrong with no hint / five hint words / with this repair: 25 minutes of Korean
+# 10.7% / 20.6% / 11.1% (the repair taking 28% longer), another 10 minutes 8.8% / 14.1% / 5.2%.
+GAP_SECONDS = 5.0
+SPARSE_SECONDS, SPARSE_LETTERS = 8.0, 2.5  # a segment this long with fewer letters per second than this
+
+
+def _repair(model, audio, start: int, end: int, options: WhisperOptions, segments: list[Segment]) -> list[Segment]:
+    first, last = start / SAMPLE_RATE, end / SAMPLE_RATE
+    edges = [first] + [t for s in segments for t in (s.start, s.end)] + [last]
+    suspect: list[tuple[float, float, list[int]]] = []  # (from, to, segments it replaces)
+    for k in range(len(segments) + 1):
+        a, b = edges[2 * k], edges[2 * k + 1]  # the silence before segment k (or after the last)
+        if b - a >= GAP_SECONDS:
+            suspect.append((a, b, []))
+        if k < len(segments):
+            seg = segments[k]
+            length = seg.end - seg.start
+            if length >= SPARSE_SECONDS and len(seg.text.replace(" ", "")) / length < SPARSE_LETTERS:
+                suspect.append((seg.start, seg.end, [k]))
+    if not suspect:
+        return segments
+    # neighbouring suspects become one stretch
+    merged: list[tuple[float, float, list[int]]] = []
+    for a, b, ks in suspect:
+        if merged and a - merged[-1][1] < 0.5:
+            merged[-1] = (merged[-1][0], max(b, merged[-1][1]), merged[-1][2] + ks)
+        else:
+            merged.append((a, b, ks))
+    drop: set[int] = set()
+    added: list[Segment] = []
+    for a, b, ks in merged:
+        lo, hi = max(start, int(a * SAMPLE_RATE)), min(end, int(b * SAMPLE_RATE))
+        if hi - lo < SAMPLE_RATE:
+            continue
+        again = _decode(model, audio, lo, hi, options, None, new_tokens(None, None), None)
+        old = sum(len(segments[k].text.replace(" ", "")) for k in ks)
+        if sum(len(s.text.replace(" ", "")) for s in again) > old:
+            drop.update(ks)
+            added.extend(again)
+    if added:
+        log.info("힌트를 준 받아쓰기에서 빠진 %d곳을 힌트 없이 다시 받아썼습니다", len(added))
+    kept = [s for k, s in enumerate(segments) if k not in drop]
+    return sorted(kept + added, key=lambda s: s.start)
+
+
+def _decode(model, audio, start: int, end: int, options: WhisperOptions, prompt: str | None, room: int,
+            on_piece: Callable[[float], None] | None) -> list[Segment]:
     offset = start / SAMPLE_RATE
     pieces, _ = model.transcribe(
         audio[start:end],
@@ -221,7 +288,7 @@ def _run(path: Path, options: WhisperOptions, device: str, progress: Progress | 
     model, compute_type = _model(options, device)
     audio = faster_whisper.decode_audio(str(path), sampling_rate=SAMPLE_RATE)  # once: hints and every part
     prompt = options.prompt
-    if options.candidates:
+    if options.candidates and not options.part_hints:  # 부분별 힌트: each part picks its own (see _span)
         prompt = _auto_prompt(model, audio, options)
     encode = _encoder(model)
     prompt = fit_prompt(prompt, encode)
@@ -248,7 +315,7 @@ def _run(path: Path, options: WhisperOptions, device: str, progress: Progress | 
             report = (lambda t, o=offset: progress(o + t, total)) if progress else None
             segments.extend(_span(model, audio, start, end, options, prompt, room, report))
     provider = f"faster-whisper {faster_whisper.__version__} ({options.model}, {device}/{compute_type})"
-    hints = tuple(prompt.split(", ")) if options.candidates and prompt else ()
+    hints = tuple(prompt.split(", ")) if options.candidates and not options.part_hints and prompt else ()
     return WhisperResult(segments, total, provider, hints)
 
 

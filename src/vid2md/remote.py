@@ -143,7 +143,10 @@ def job_options(job: dict[str, Any], whisper: WhisperOptions) -> Options:
         force_whisper=bool(job.get("force_whisper")),
         whisper=replace(whisper, prompt=job.get("prompt") or whisper.prompt,
                         # "자동 선택": the dashboard sends the whole dictionary; the recording picks from it.
-                        candidates=tuple((str(w), str(p)) for w, p in job.get("glossary") or ())),
+                        candidates=tuple((str(w), str(p)) for w, p in job.get("glossary") or ()),
+                        # a picked pack too big for the hint room comes the same way, its leading words as the fallback
+                        fallback=bool(job.get("glossary_fallback")),
+                        part_hints=bool(job.get("part_hints"))),
         diarize=bool(picked.get("diarize")),
         num_speakers=int(speakers) if speakers else None,
         denoise=bool(picked.get("denoise")),
@@ -290,7 +293,11 @@ class Worker:
                     log.warning("진행 상황 보고 실패: %s", error)
 
         start, end = float(part["start"]), float(part["end"])
-        whisper = replace(self._whisper_for(job), prompt=job.get("prompt") or None, candidates=(), share=None)
+        # 부분별 힌트: the part comes with the pack, and picks its own hints from it
+        own = bool(job.get("part_hints"))
+        whisper = replace(self._whisper_for(job), prompt=job.get("prompt") or None, share=None, part_hints=own,
+                          candidates=tuple((str(w), str(p)) for w, p in job.get("glossary") or ()) if own else (),
+                          fallback=bool(job.get("glossary_fallback")) and own)
         rate = int(job.get("cbr") or 0)
         if rate and job["kind"] == "upload":
             # An MP3 the workers made (constant bit rate): only the bytes of this part, a little either side.

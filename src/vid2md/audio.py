@@ -5,11 +5,22 @@ from __future__ import annotations
 from pathlib import Path
 
 MP3_RATE = 44100
-MP3_BITRATE = 64000  # mono speech; about 29 MB per hour
+MP3_BITRATE = 64000  # mono speech; about 29 MB per hour. Constant: a helper takes its part's bytes by time (remote.py)
 
 
 class AudioError(RuntimeError):
     """The file has no sound to save, or it could not be read."""
+
+
+def media_seconds(path: Path) -> float:
+    """How long a media file plays (0 when its container does not say)."""
+    import av
+
+    try:
+        with av.open(str(path)) as container:
+            return float(container.duration or 0) / 1_000_000
+    except Exception:  # noqa: BLE001 - only a hint
+        return 0.0
 
 
 def extract_mp3(source: Path, target: Path, bitrate: int = MP3_BITRATE) -> Path:

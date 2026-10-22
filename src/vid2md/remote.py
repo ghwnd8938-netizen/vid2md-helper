@@ -28,7 +28,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
-from .audio import extract_mp3
+from .audio import extract_mp3, media_seconds
 from .markdown import render
 from .pipeline import Options, build_transcript
 from .segments import Segment, format_timestamp
@@ -43,6 +43,11 @@ PROGRESS_EVERY = 15.0  # seconds between progress reports
 WAIT_EVERY = 10.0  # seconds between asks while other workers finish their parts
 AUDIO_SUFFIXES = {".mp3", ".m4a", ".wav", ".flac", ".ogg", ".opus", ".aac", ".wma"}
 LINGER_EVERY = 15.0  # seconds between asks while a 서브 서버 waits for parts that may still come back
+# A runner started for parts waits this long for them: it may start before the recording is split (the dashboard
+# starts runners as soon as it knows a recording is long), and a part whose helper went quiet comes back later.
+PARTS_LINGER = 240.0
+PART_MARGIN = 3.0  # seconds of sound taken on each side of a part fetched by its bytes (MP3 frames start mid-way)
+PARALLEL_PIECES = 3  # pieces of a sound fetched at once through the dashboard
 SAFE = {"safe": True}
 KEY_NAMES = {"full": "전체(WORKER_SECRET)", "limited": "제한(WORKER_SECRET_LIMITED)", "helper": "서브(WORKER_SECRET_HELPER)"}  # a log line that carries only ids, part numbers and counts: fine for a public log
 
@@ -116,10 +121,11 @@ class Dashboard:
             with urllib.request.urlopen(put, timeout=self.timeout) as response:
                 return json.loads(response.read() or b"{}").get("id", "")
 
-    def download(self, file_id: str, token: str, out) -> None:
-        request = urllib.request.Request(
-            f"{self.drive_api}/files/{file_id}?alt=media", headers={"authorization": f"Bearer {token}"}
-        )
+    def download(self, file_id: str, token: str, out, byte_range: tuple[int, int] | None = None) -> None:
+        headers = {"authorization": f"Bearer {token}"}
+        if byte_range:
+            headers["range"] = f"bytes={byte_range[0]}-{byte_range[1]}"
+        request = urllib.request.Request(f"{self.drive_api}/files/{file_id}?alt=media", headers=headers)
         with urllib.request.urlopen(request, timeout=self.timeout) as response:
             while block := response.read(1 << 20):
                 out.write(block)
@@ -282,16 +288,30 @@ class Worker:
                 except RemoteError as error:
                     log.warning("진행 상황 보고 실패: %s", error)
 
-        if not self.held:
-            work = tempfile.mkdtemp(prefix="vid2md-part-")
-            try:
-                self.held = (job["id"], self._fetch_sound(job, Path(work)), work)
-            except BaseException:
-                shutil.rmtree(work, ignore_errors=True)
-                raise
-        report(0.0)
+        start, end = float(part["start"]), float(part["end"])
         whisper = replace(self._whisper_for(job), prompt=job.get("prompt") or None, candidates=(), share=None)
-        segments = self.span(self.held[1], whisper, float(part["start"]), float(part["end"]), report)
+        rate = int(job.get("cbr") or 0)
+        if rate and job["kind"] == "upload":
+            # An MP3 the workers made (constant bit rate): only the bytes of this part, a little either side.
+            self._drop_held()
+            with tempfile.TemporaryDirectory(prefix="vid2md-part-") as work:
+                first = max(0.0, start - PART_MARGIN)
+                window = (int(first * rate), int((end + PART_MARGIN) * rate))
+                sound = self._fetch_window(job, window, Path(work) / "part.mp3")
+                offset = window[0] / rate
+                report(0.0)
+                segments = [Segment(s.start + offset, s.end + offset, s.text, s.speaker)
+                            for s in self.span(sound, whisper, start - offset, end - offset, report)]
+        else:
+            if not self.held:
+                work = tempfile.mkdtemp(prefix="vid2md-part-")
+                try:
+                    self.held = (job["id"], self._fetch_sound(job, Path(work)), work)
+                except BaseException:
+                    shutil.rmtree(work, ignore_errors=True)
+                    raise
+            report(0.0)
+            segments = self.span(self.held[1], whisper, start, end, report)
         self.dashboard.call("worker_part_done", id=job["id"], part=index, segments=segments_json(segments))
         log.info("부분 처리 완료: %s (%d번째)", self._label(job), index + 1, extra=SAFE)
 
@@ -314,6 +334,20 @@ class Worker:
         except Exception as error:  # noqa: BLE001
             log.warning("화면 글자를 읽지 못했습니다: %s", error)
             return ()
+
+    def _fetch_window(self, job: dict[str, Any], window: tuple[int, int], target: Path) -> Path:
+        """Bytes window[0]..window[1] of the job's MP3: from Drive with a trusted key, else through the dashboard."""
+        with target.open("wb") as out:
+            if job.get("access_token"):
+                self.dashboard.download(job["chunks"][0], job["access_token"], out, byte_range=window)
+            else:
+                count, index = 1, 0
+                while index < count:
+                    answer = self.dashboard.call("worker_audio", id=job["id"], index=index, **{"from": window[0], "to": window[1]})
+                    count = int(answer.get("chunks") or 1)
+                    out.write(base64.b64decode(answer["data"]))
+                    index += 1
+        return target
 
     def _fetch_sound(self, job: dict[str, Any], work: Path) -> Path:
         if job["kind"] == "youtube":
@@ -354,6 +388,7 @@ class Worker:
             early.update(self._keep_audio(audio, place["media"], place["work"] / "audio.mp3"))
             return early.get("audio_id")
 
+        share = None
         if not (options.diarize or options.denoise):
             # Speaker labels and voice isolation need the whole recording in one place; the rest can be shared.
             share = PartShare(self.dashboard, job["id"], self.clock, self.sleep, sound)
@@ -372,6 +407,8 @@ class Worker:
                 else:  # the external server: through the dashboard, this job only
                     self._download_audio(job, media)
                 place.update(media=media, work=Path(work))
+                if share:
+                    self._announce_length(job, media)
                 if (job.get("options") or {}).get("slides") and job.get("access_token") and not mp3:
                     words = self._read_slides(job, media, report)
                     if words:
@@ -407,6 +444,16 @@ class Worker:
             **kept,
         )
         log.info("작업 완료: %s", transcript.source.title)
+
+    def _announce_length(self, job: dict[str, Any], media: Path) -> None:
+        """A recording that will be shared: its length lets the dashboard start the helpers before it is split."""
+        seconds = media_seconds(media)
+        if not seconds:
+            return
+        try:
+            self.dashboard.call("worker_progress", id=job["id"], stage="음성 인식 준비 중", progress=0, seconds=round(seconds))
+        except RemoteError as error:
+            log.warning("진행 상황 보고 실패: %s", error)
 
     def _keep(self, job: dict[str, Any], media: Path, work: Path, report: Callable[..., None],
               audio_kept: dict[str, str] | None = None) -> dict[str, str]:
@@ -460,10 +507,16 @@ class Worker:
                     self.dashboard.download(file_id, token, out)
 
     def _download_audio(self, job: dict[str, Any], target: Path) -> None:
-        """The external server's way in: the job's sound (its MP3 or the uploaded recording) through the dashboard."""
-        with target.open("wb") as out:
-            for index in range(int(job["audio_chunks"])):
-                out.write(base64.b64decode(self.dashboard.call("worker_audio", id=job["id"], index=index)["data"]))
+        """The external server's way in: the job's sound (its MP3 or the uploaded recording) through the dashboard,
+        a few pieces at once (each answer takes seconds; the dashboard's limit on answers keeps the pieces small)."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        def piece(index: int) -> bytes:
+            return base64.b64decode(self.dashboard.call("worker_audio", id=job["id"], index=index)["data"])
+
+        with target.open("wb") as out, ThreadPoolExecutor(PARALLEL_PIECES) as pool:
+            for data in pool.map(piece, range(int(job["audio_chunks"]))):
+                out.write(data)
 
     def drain(self, attempts: int = 3, backoff: float = 10.0, linger: float = 0.0) -> int:
         """Process jobs until the queue is empty; returns how many were processed. With linger, keep asking that
@@ -554,7 +607,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--parts-only", action="store_true",
                         help="긴 녹음의 부분만 돕고 작업 전체는 가져가지 않음 (비공개 서브 서버용)")
     parser.add_argument("--linger", type=float, default=None,
-                        help="할 일이 없을 때 더 기다리는 시간(초). 서브 서버 기본 90, --drain 기본 0")
+                        help="할 일이 없을 때 더 기다리는 시간(초). 서브 서버 기본 240, --drain 기본 0")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", stream=sys.stderr)
     if args.helper:
@@ -607,7 +660,7 @@ def _main(args: argparse.Namespace) -> int:
         worker.run_once()
         return 0
     if args.drain or args.helper or args.parts_only:
-        linger = args.linger if args.linger is not None else (90.0 if args.helper or args.parts_only else 0.0)
+        linger = args.linger if args.linger is not None else (PARTS_LINGER if args.helper or args.parts_only else 0.0)
         try:
             count = worker.drain(linger=linger) if linger else worker.drain()
         except KeyboardInterrupt:

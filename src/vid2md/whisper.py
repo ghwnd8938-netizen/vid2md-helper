@@ -6,7 +6,7 @@ import logging
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Protocol
+from typing import Any, Callable, Protocol
 
 from .segments import Segment, Word
 
@@ -168,14 +168,21 @@ def _auto_prompt(model, audio, options: WhisperOptions) -> str | None:
     return ", ".join(words) or None
 
 
+_LOADED: dict[tuple[Any, str, str, str], Any] = {}  # the last model loaded: a helper does part after part with it
+
+
 def _model(options: WhisperOptions, device: str):
     from faster_whisper import WhisperModel
 
     compute_type = options.compute_type
     if compute_type == "auto":
         compute_type = "float16" if device == "cuda" else "int8"
-    log.info("모델 로드: %s (%s/%s) — 처음에는 모델 다운로드로 시간이 걸립니다", options.model, device, compute_type)
-    return WhisperModel(options.model, device=device, compute_type=compute_type), compute_type
+    key = (WhisperModel, options.model, device, compute_type)
+    if key not in _LOADED:
+        _LOADED.clear()  # one model at a time (memory)
+        log.info("모델 로드: %s (%s/%s) — 처음에는 모델 다운로드로 시간이 걸립니다", options.model, device, compute_type)
+        _LOADED[key] = WhisperModel(options.model, device=device, compute_type=compute_type)
+    return _LOADED[key], compute_type
 
 
 def _span(model, audio, start: int, end: int, options: WhisperOptions, prompt: str | None, room: int,

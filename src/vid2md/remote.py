@@ -13,9 +13,12 @@ from __future__ import annotations
 import argparse
 import base64
 import getpass
+import hashlib
+import hmac
 import json
 import logging
 import os
+import secrets
 import shutil
 import signal
 import socket
@@ -76,15 +79,77 @@ class RemoteError(RuntimeError):
 
 
 class Dashboard:
-    """Client for the Apps Script web app (JSON posted as text/plain, redirects followed)."""
+    """Client for the Apps Script web app (JSON posted as text/plain, redirects followed), and for the job queue
+    (vid2md-queue on SJAMES) when ``queue_url`` is set: the calls workers make all day (asking for work, progress, the
+    parts of long recordings) go to the queue, signed with the key (never sent); files and results stay with the
+    dashboard. Without a queue everything goes to the dashboard as before."""
 
-    def __init__(self, url: str, secret: str, drive_api: str = DRIVE_API, timeout: float = 120, name: str = ""):
+    QUEUE_ACTIONS = {"worker_next": "next", "worker_part_done": "part_done"}
+    QUEUE_RECHECK_SECONDS = 300  # how often a worker using the queue asks the dashboard whether it still should
+
+    def __init__(self, url: str, secret: str, drive_api: str = DRIVE_API, timeout: float = 120, name: str = "",
+                 queue_url: str = ""):
         self.url, self.secret, self.drive_api, self.timeout = url, secret, drive_api, timeout
+        self.queue_url = (queue_url or os.environ.get("VID2MD_QUEUE_URL", "")).strip().rstrip("/")
+        self.queue_checked = time.monotonic()
         # Tells two servers with the same key apart (which one holds which part of a shared recording).
-        # VID2MD_WORKER_NAME marks a kind of worker (Colab's notebook sets "colab:…", which the dashboard notices).
+        # VID2MD_WORKER_NAME names this worker; the dashboard knows a job's worker by it (and ignores late answers
+        # from one whose job another took over).
         self.name = name or os.environ.get("VID2MD_WORKER_NAME", "").strip() or f"{socket.gethostname()}:{os.getpid()}"
 
     def call(self, action: str, **params: Any) -> dict[str, Any]:
+        if self.queue_url and action == "worker_claim" and time.monotonic() - self.queue_checked > self.QUEUE_RECHECK_SECONDS:
+            # Still the queue? The dashboard decides (turning it off brings every worker back within minutes).
+            self.queue_checked = time.monotonic()
+            self._dashboard("worker_ping")
+        if self.queue_url:
+            routed = self._via_queue(action, params)
+            if routed is not None:
+                return routed
+        answer = self._dashboard(action, **params)
+        if action == "worker_claim" and self.queue_url and not answer.get("job"):
+            return self._via_queue(action, params) or answer  # just sent to the queue: ask there right away
+        return answer
+
+    def _via_queue(self, action: str, params: dict[str, Any]) -> dict[str, Any] | None:
+        """The queue's share of the calls (None: the dashboard's)."""
+        part = params.get("part")
+        if action == "worker_claim":
+            got = self.queue("claim", parts_only=params.get("parts_only") is True).get("job")
+            if not got:
+                return {"ok": True, "job": None}
+            # The dashboard checks with the queue that this worker holds it, then hands out the files and tokens.
+            return self._dashboard("worker_start", id=got["id"], attempt=got.get("attempt"),
+                                   prepare=got.get("prepare") is True, part=(got.get("part") or {}).get("index"))
+        if action == "worker_progress" and "seconds" not in params:
+            return self.queue("progress", **params)
+        if action in self.QUEUE_ACTIONS:
+            return self.queue(self.QUEUE_ACTIONS[action], **params)
+        if action in ("worker_release", "worker_fail") and part is not None:
+            return self.queue("part_back", id=params.get("id"), part=part, failed=action == "worker_fail")
+        return None
+
+    def queue(self, action: str, **params: Any) -> dict[str, Any]:
+        path = f"/w/{action}"
+        body = json.dumps(params).encode()
+        ts, nonce = str(int(time.time())), secrets.token_hex(16)
+        message = f"{ts}\n{nonce}\nPOST {path}\n{hashlib.sha256(body).hexdigest()}".encode()
+        headers = {"content-type": "application/json", "x-vid2md-ts": ts, "x-vid2md-nonce": nonce,
+                   "x-vid2md-worker": self.name,
+                   "x-vid2md-sig": hmac.new(self.secret.encode(), message, hashlib.sha256).hexdigest()}
+        request = urllib.request.Request(self.queue_url + path, data=body, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                data = json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            raise RemoteError(f"queue {action}: HTTP {error.code}") from error
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as error:
+            raise RemoteError(f"queue {action}: {error}") from error
+        if not data.get("ok"):
+            raise RemoteError(f"queue {action}: {data.get('error', 'unknown error')}")
+        return data
+
+    def _dashboard(self, action: str, **params: Any) -> dict[str, Any]:
         body = json.dumps({"action": action, "secret": self.secret, "worker": self.name, **params}).encode()
         request = urllib.request.Request(self.url, data=body, headers={"content-type": "text/plain;charset=utf-8"})
         try:
@@ -95,7 +160,18 @@ class Dashboard:
             raise RemoteError(f"{action}: {error}") from error
         if not data.get("ok"):
             raise RemoteError(f"{action}: {data.get('error', 'unknown error')}")
+        self._follow_queue(action, data)
         return data
+
+    def _follow_queue(self, action: str, data: dict[str, Any]) -> None:
+        """The dashboard says where the queue is (worker_claim, worker_ping); a ping without it means: no queue."""
+        url = str(data.get("queue_url") or "").strip().rstrip("/")
+        if url and url.startswith("https://") and url != self.queue_url:
+            log.info("작업 대기열을 씁니다: %s", url)
+            self.queue_url, self.queue_checked = url, time.monotonic()
+        elif not url and action == "worker_ping" and self.queue_url:
+            log.info("작업 대기열을 쓰지 않습니다: 대시보드로 돌아갑니다")
+            self.queue_url = ""
 
     def upload(self, path: Path, folder_id: str, name: str, token: str) -> str:
         """Put a file into a Drive folder (resumable upload, sent in one request); returns its id."""
@@ -133,6 +209,27 @@ class Dashboard:
 
 
 Transcribe = Callable[..., Any]
+
+MODEL_FILES = {"config.json", "model.bin", "tokenizer.json", "preprocessor_config.json", "vocabulary.json",
+               "vocabulary.txt"}
+
+
+def unpack_model(archive: Path, target: Path) -> None:
+    """A trained model's .tar.gz (the CTranslate2 files, at its top level or in one folder): only those files are
+    taken, by their bare names, so nothing in the archive can write anywhere else."""
+    import tarfile
+
+    target.mkdir(parents=True)
+    with tarfile.open(archive, "r:gz") as tar:
+        for member in tar.getmembers():
+            name = Path(member.name).name
+            if member.isfile() and name in MODEL_FILES:
+                source = tar.extractfile(member)
+                if source is not None:
+                    with source, (target / name).open("wb") as out:
+                        shutil.copyfileobj(source, out)
+    if not (target / "model.bin").exists():
+        raise ValueError("모델 파일(model.bin)이 없습니다")
 
 
 def job_options(job: dict[str, Any], whisper: WhisperOptions) -> Options:
@@ -326,7 +423,37 @@ class Worker:
     def _whisper_for(self, job: dict[str, Any]) -> WhisperOptions:
         if (job.get("options") or {}).get("hq"):
             return replace(self.whisper, model=self.hq_model, best_of=1)  # one retry candidate: see WhisperOptions
-        return self.whisper
+        trained = self._trained_model(job.get("model"), job.get("access_token"))
+        return replace(self.whisper, model=trained) if trained else self.whisper
+
+    def _trained_model(self, model: dict[str, Any] | None, token: str | None) -> str | None:
+        """학습한 모델 (see deploy/TRAINING.md): the admin switched the trusted workers to a model trained on our own
+        corrected transcripts. It comes from the admin's Drive once and stays on this machine; if it can't be had, the
+        job goes on with the usual model."""
+        if not model or not model.get("file"):
+            return None
+        file_id = str(model["file"])
+        if not file_id.replace("-", "").replace("_", "").isalnum():
+            return None
+        home = Path(os.environ.get("VID2MD_MODEL_CACHE") or Path.home() / ".cache" / "vid2md" / "models")
+        target = home / file_id
+        if (target / "model.bin").exists():
+            return str(target)
+        try:
+            token = token or self.dashboard.call("worker_token")["access_token"]
+            home.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(dir=home) as work:
+                archive = Path(work) / "model.tar.gz"
+                with archive.open("wb") as out:
+                    self.dashboard.download(file_id, token, out)
+                unpacked = Path(work) / "model"
+                unpack_model(archive, unpacked)
+                unpacked.rename(target)
+        except Exception as error:  # noqa: BLE001 - the usual model still does the job
+            log.warning("학습한 모델을 받지 못해 기본 모델로 합니다: %s", error)
+            return None
+        log.info("학습한 모델을 씁니다: %s", model.get("label") or file_id)
+        return str(target)
 
     def _read_slides(self, job: dict[str, Any], media: Path, report: Callable[..., None]) -> tuple[str, ...]:
         """화면 글자: read the video's slides and hand the text in; returns the words to use as hint candidates.

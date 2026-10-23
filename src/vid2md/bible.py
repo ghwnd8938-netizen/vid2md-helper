@@ -3,7 +3,7 @@
 Only about 40 hint words fit in front of the speech recogniser, so the Bible is used after it instead, with no limit:
 
 - verses read aloud are looked up in all 31,103 verses (nobody has to say the reference). A line that is a whole verse
-  but for a few letters becomes that verse; other lines that follow a verse closely are offered in the editor.
+  but for a letter or two becomes that verse (see SAME); other lines that follow a verse closely are offered in the editor.
 - a book name one syllable off before "N장" is put right ("요안복음 3장" → "요한복음 3장"); other Bible names one
   syllable off are offered.
 
@@ -69,7 +69,12 @@ CHAPTER = re.compile(r"([가-힣]{2,8})(\s*)(\d+)\s*장")
 WORD = re.compile(r"[가-힣]+")
 MIN_MATCH = 15  # letters a line must share with a verse before it is offered
 NEAR = 0.8  # share of a line's letters found in the verse(s), in order
-SAME = 0.92  # a line this close to whole verses (both ways) becomes them
+# A line becomes the verse by itself only when it is that verse but for a slip of the ear: nearly every letter both ways,
+# about as long, and saying "not" as often (a preacher's own wording or a different translation stays as spoken, and is
+# offered in the editor instead). Everything else is a suggestion.
+SAME = 0.96
+SAME_LENGTH = 0.1  # the line's letters within this share of the verse's
+NEGATIONS = re.compile(r"아니|않|못|말라|말지|없")
 WHOLE = 0.85  # a line that holds this much of the verse(s) may be replaced by them in the editor (less: shown only)
 
 _index = None  # (verses, normalized texts, gram keys sorted, verse ids for them, vocabulary)
@@ -207,7 +212,9 @@ def check(lines: list[str]) -> tuple[list[str], list[dict]]:
             continue  # already word for word
         item = {"kind": "verse", "line": i, "lines": span, "ref": ref(verses[a], verses[b] if b > a else None),
                 "text": verse_text, "score": round(min(near, cover), 3), "whole": span == 1 and cover >= WHOLE}
-        if span == 1 and near >= SAME and cover >= SAME:
+        said, verse = normalize(out[i]), "".join(norm[a : b + 1])
+        if (span == 1 and near >= SAME and cover >= SAME and abs(len(said) - len(verse)) <= SAME_LENGTH * len(verse)
+                and len(NEGATIONS.findall(said)) == len(NEGATIONS.findall(verse))):
             item.update(auto=True, was=out[i])
             out[i] = verse_text
         found.append(item)
